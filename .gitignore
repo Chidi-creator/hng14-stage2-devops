@@ -11,3 +11,7 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Env files (secrets — never commit)
+.env
+.env.*
+
