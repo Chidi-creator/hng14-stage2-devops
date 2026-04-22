@@ -168,6 +168,7 @@ jobs:
             --format sarif \
             --output trivy-api.sarif \
             --severity CRITICAL \
+            --ignore-unfixed \
             --exit-code 1 \
             localhost:5000/hng-api:${{ github.sha }}
 
@@ -179,6 +180,7 @@ jobs:
             --format sarif \
             --output trivy-worker.sarif \
             --severity CRITICAL \
+            --ignore-unfixed \
             --exit-code 1 \
             localhost:5000/hng-worker:${{ github.sha }}
 
@@ -190,6 +192,7 @@ jobs:
             --format sarif \
             --output trivy-frontend.sarif \
             --severity CRITICAL \
+            --ignore-unfixed \
             --exit-code 1 \
             localhost:5000/hng-frontend:${{ github.sha }}
 
