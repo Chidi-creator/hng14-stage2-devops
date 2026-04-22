@@ -121,15 +121,16 @@ jobs:
 
       - name: Push to GitHub Container Registry
         run: |
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           for svc in api worker frontend; do
             docker tag localhost:5000/hng-${svc}:${{ github.sha }} \
-              ghcr.io/${{ github.repository }}/hng-${svc}:${{ github.sha }}
+              ghcr.io/${REPO}/hng-${svc}:${{ github.sha }}
             docker tag localhost:5000/hng-${svc}:${{ github.sha }} \
-              ghcr.io/${{ github.repository }}/hng-${svc}:latest
-            docker push ghcr.io/${{ github.repository }}/hng-${svc}:${{ github.sha }}
-            docker push ghcr.io/${{ github.repository }}/hng-${svc}:latest
+              ghcr.io/${REPO}/hng-${svc}:latest
+            docker push ghcr.io/${REPO}/hng-${svc}:${{ github.sha }}
+            docker push ghcr.io/${REPO}/hng-${svc}:latest
           done
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -303,6 +304,7 @@ jobs:
             set -euo pipefail
 
             REGISTRY="ghcr.io"
+            REPO=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
             NETWORK="hng_backend"
             ENV_FILE="/opt/app/.env"
 
