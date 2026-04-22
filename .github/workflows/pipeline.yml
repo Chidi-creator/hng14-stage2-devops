@@ -288,6 +288,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - name: Rolling update on production server
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.0.3
         env:
           SHA: ${{ github.sha }}
