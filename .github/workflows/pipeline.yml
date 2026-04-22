@@ -1,0 +1,361 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write   # SARIF upload to Security tab
+  packages: write          # Push to GHCR for deploy stage
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. LINT
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Python (flake8)
+        run: |
+          pip install flake8
+          flake8 api/main.py --max-line-length=100
+
+      - name: Install Node dependencies (includes eslint devDep)
+        working-directory: frontend
+        run: npm install
+
+      - name: Lint JavaScript (eslint)
+        working-directory: frontend
+        run: npx eslint app.js
+
+      - name: Install hadolint
+        run: |
+          curl -sL \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64 \
+            -o /usr/local/bin/hadolint
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Lint Dockerfiles (hadolint)
+        run: |
+          hadolint api/Dockerfile
+          hadolint worker/Dockerfile
+          hadolint frontend/Dockerfile
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. TEST
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r api/requirements.txt pytest pytest-cov httpx
+
+      - name: Run unit tests with coverage
+        working-directory: api
+        run: |
+          pytest tests/ -v \
+            --cov=main \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. BUILD
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push to local registry
+        run: |
+          for svc in api worker frontend; do
+            docker build \
+              -t localhost:5000/hng-${svc}:${{ github.sha }} \
+              -t localhost:5000/hng-${svc}:latest \
+              ./${svc}
+            docker push localhost:5000/hng-${svc}:${{ github.sha }}
+            docker push localhost:5000/hng-${svc}:latest
+          done
+
+      - name: Export images as tarballs for downstream jobs
+        run: |
+          mkdir -p /tmp/images
+          for svc in api worker frontend; do
+            docker save localhost:5000/hng-${svc}:${{ github.sha }} \
+              | gzip > /tmp/images/hng-${svc}.tar.gz
+          done
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images/
+          retention-days: 1
+
+      - name: Push to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          for svc in api worker frontend; do
+            docker tag localhost:5000/hng-${svc}:${{ github.sha }} \
+              ghcr.io/${{ github.repository }}/hng-${svc}:${{ github.sha }}
+            docker tag localhost:5000/hng-${svc}:${{ github.sha }} \
+              ghcr.io/${{ github.repository }}/hng-${svc}:latest
+            docker push ghcr.io/${{ github.repository }}/hng-${svc}:${{ github.sha }}
+            docker push ghcr.io/${{ github.repository }}/hng-${svc}:latest
+          done
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. SECURITY SCAN
+  # ──────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images
+
+      - name: Load images into Docker
+        run: |
+          for svc in api worker frontend; do
+            gunzip -c /tmp/images/hng-${svc}.tar.gz | docker load
+          done
+
+      - name: Install Trivy
+        run: |
+          curl -sfL \
+            https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.57.0
+
+      # Scan each image: always produce SARIF (for upload), then fail if CRITICAL found.
+      # continue-on-error lets us upload SARIF even when a CRITICAL is detected;
+      # we propagate the failure explicitly at the end.
+      - name: Scan hng-api
+        id: scan-api
+        continue-on-error: true
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-api.sarif \
+            --severity CRITICAL \
+            --exit-code 1 \
+            localhost:5000/hng-api:${{ github.sha }}
+
+      - name: Scan hng-worker
+        id: scan-worker
+        continue-on-error: true
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-worker.sarif \
+            --severity CRITICAL \
+            --exit-code 1 \
+            localhost:5000/hng-worker:${{ github.sha }}
+
+      - name: Scan hng-frontend
+        id: scan-frontend
+        continue-on-error: true
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-frontend.sarif \
+            --severity CRITICAL \
+            --exit-code 1 \
+            localhost:5000/hng-frontend:${{ github.sha }}
+
+      - name: Upload API scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-api.sarif
+          category: trivy-hng-api
+
+      - name: Upload worker scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-worker.sarif
+          category: trivy-hng-worker
+
+      - name: Upload frontend scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: trivy-hng-frontend
+
+      - name: Fail pipeline if any CRITICAL CVEs found
+        if: |
+          steps.scan-api.outcome    == 'failure' ||
+          steps.scan-worker.outcome == 'failure' ||
+          steps.scan-frontend.outcome == 'failure'
+        run: |
+          echo "One or more images contain CRITICAL vulnerabilities."
+          echo "See the Security tab for details."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 5. INTEGRATION TEST
+  # ──────────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring full stack up
+        run: docker compose up --build -d
+
+      - name: Wait for frontend to be reachable (max 120s)
+        run: |
+          timeout 120 bash -c \
+            'until curl -sf http://localhost:3000/ > /dev/null; do sleep 3; done'
+
+      - name: Submit job and assert completion
+        run: |
+          # Submit a job through the frontend proxy
+          RESPONSE=$(curl -sf -X POST http://localhost:3000/submit)
+          JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id')
+          echo "Submitted job: $JOB_ID"
+
+          # Poll until status == "completed" (max 30s)
+          DONE=false
+          for i in $(seq 1 15); do
+            STATUS=$(curl -sf "http://localhost:3000/status/$JOB_ID" | jq -r '.status')
+            echo "  attempt $i: status=$STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              DONE=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$DONE" = "true" ]; then
+            echo "PASS: job $JOB_ID reached 'completed'"
+          else
+            echo "FAIL: job $JOB_ID did not complete within 30s"
+            docker compose logs
+            exit 1
+          fi
+
+      - name: Tear down stack (always runs)
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 6. DEPLOY  (main branch only, push events only)
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Rolling update on production server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: SHA,REPO
+          # The script runs on the remote server.
+          # Assumptions:
+          #   - Docker is installed
+          #   - The backend network exists (created by the initial docker compose up)
+          #   - /opt/app/.env holds runtime env vars (REDIS_HOST, QUEUE_NAME, API_URL, …)
+          #   - The server is already logged in to ghcr.io
+          script: |
+            set -euo pipefail
+
+            REGISTRY="ghcr.io"
+            NETWORK="hng_backend"
+            ENV_FILE="/opt/app/.env"
+
+            rolling_update() {
+              local service="$1"
+              local extra_flags="${2:-}"
+              local image="${REGISTRY}/${REPO}/hng-${service}:${SHA}"
+              local canary="${service}_canary"
+
+              echo "==> [${service}] pulling ${image}"
+              docker pull "${image}"
+
+              # Remove any stale canary from a previous failed run
+              docker rm -f "${canary}" 2>/dev/null || true
+
+              echo "==> [${service}] starting canary"
+              # shellcheck disable=SC2086
+              docker run -d \
+                --name "${canary}" \
+                --network "${NETWORK}" \
+                --env-file "${ENV_FILE}" \
+                ${extra_flags} \
+                "${image}"
+
+              echo "==> [${service}] waiting up to 60s for health check"
+              local elapsed=0
+              local healthy=false
+              while [ "${elapsed}" -lt 60 ]; do
+                local status
+                status=$(docker inspect \
+                  --format='{{.State.Health.Status}}' "${canary}" 2>/dev/null \
+                  || echo "none")
+                if [ "${status}" = "healthy" ]; then
+                  healthy=true
+                  break
+                fi
+                sleep 2
+                elapsed=$((elapsed + 2))
+              done
+
+              if [ "${healthy}" = "true" ]; then
+                echo "==> [${service}] healthy — promoting canary, stopping old container"
+                docker rm -f "${service}" 2>/dev/null || true
+                docker rename "${canary}" "${service}"
+                echo "==> [${service}] update complete (${SHA})"
+              else
+                echo "==> [${service}] ABORT: canary not healthy within 60s"
+                echo "==> [${service}] old container preserved; removing canary"
+                docker rm -f "${canary}" 2>/dev/null || true
+                return 1
+              fi
+            }
+
+            rolling_update "api"
+            rolling_update "worker"
+            rolling_update "frontend" "-p 3000:3000"
