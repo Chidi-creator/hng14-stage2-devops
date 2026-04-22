@@ -1,6 +1,6 @@
 name: CI/CD Pipeline
 
-on:
+"on":
   push:
     branches: ["**"]
   pull_request:
@@ -155,13 +155,11 @@ jobs:
 
       - name: Install Trivy
         run: |
-          curl -sfL \
-            https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.57.0
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      # Scan each image: always produce SARIF (for upload), then fail if CRITICAL found.
-      # continue-on-error lets us upload SARIF even when a CRITICAL is detected;
-      # we propagate the failure explicitly at the end.
+      # continue-on-error so SARIF is always uploaded even when CRITICALs are found;
+      # failure is propagated explicitly at the end of the job.
       - name: Scan hng-api
         id: scan-api
         continue-on-error: true
@@ -195,23 +193,25 @@ jobs:
             --exit-code 1 \
             localhost:5000/hng-frontend:${{ github.sha }}
 
+      # hashFiles() returns '' when the file is missing, guarding against
+      # the upload action crashing if a scan step failed before writing output.
       - name: Upload API scan results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-api.sarif') != ''
         with:
           sarif_file: trivy-api.sarif
           category: trivy-hng-api
 
       - name: Upload worker scan results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-worker.sarif') != ''
         with:
           sarif_file: trivy-worker.sarif
           category: trivy-hng-worker
 
       - name: Upload frontend scan results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-frontend.sarif') != ''
         with:
           sarif_file: trivy-frontend.sarif
           category: trivy-hng-frontend
